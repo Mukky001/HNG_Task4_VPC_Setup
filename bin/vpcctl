@@ -242,6 +242,53 @@ delete_vpc() {
     
     log_info "✓ VPC '$vpc_name' deleted successfully"
 }
+# Check if subnet exists
+subnet_exists() {
+    local vpc_name=$1
+    local subnet_name=$2
+    init_state
+    
+    if command -v jq &> /dev/null; then
+        jq -e --arg vpc "$vpc_name" --arg subnet "$subnet_name" \
+            '.[$vpc].subnets[$subnet]' "$STATE_FILE" > /dev/null 2>&1
+    else
+        grep -q "\"$subnet_name\"" "$STATE_FILE" 2>/dev/null
+    fi
+}
+
+# Save subnet state
+save_subnet_state() {
+    local vpc_name=$1
+    local subnet_name=$2
+    local subnet_cidr=$3
+    local subnet_type=$4
+    local ns_name=$5
+    local subnet_ip=$6
+    
+    init_state
+    
+    if command -v jq &> /dev/null; then
+        local temp_file=$(mktemp)
+        jq --arg vpc "$vpc_name" \
+           --arg subnet "$subnet_name" \
+           --arg cidr "$subnet_cidr" \
+           --arg type "$subnet_type" \
+           --arg ns "$ns_name" \
+           --arg ip "$subnet_ip" \
+           '.[$vpc].subnets[$subnet] = {
+               "cidr": $cidr,
+               "type": $type,
+               "namespace": $ns,
+               "ip": $ip,
+               "created_at": (now | todate)
+           }' "$STATE_FILE" > "$temp_file"
+        mv "$temp_file" "$STATE_FILE"
+    else
+        log_warning "jq not found, state update limited"
+    fi
+    
+    log_info "Saved subnet state: $subnet_name"
+}
 # Add subnet to VPC
 add_subnet() {
     local vpc_name=""
