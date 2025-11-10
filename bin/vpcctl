@@ -418,13 +418,26 @@ Usage: vpcctl <command> [options]
 
 Commands:
     create      Create a new VPC
+    add-subnet   Add a subnet to a VPC
     delete      Delete a VPC
     list        List all VPCs
     help        Show this help message
 
 Examples:
+    Examples:
+    # Create a VPC
     sudo vpcctl create --name dev-vpc --cidr 10.0.0.0/16
+    
+    # Add a public subnet
+    sudo vpcctl add-subnet --vpc dev-vpc --name public --cidr 10.0.1.0/24 --type public
+    
+    # Add a private subnet
+    sudo vpcctl add-subnet --vpc dev-vpc --name private --cidr 10.0.2.0/24 --type private
+    
+    # List all VPCs
     sudo vpcctl list
+    
+    # Delete a VPC
     sudo vpcctl delete --name dev-vpc
 
 EOF
@@ -439,6 +452,9 @@ shift || true
 case "$COMMAND" in
     create)
         create_vpc "$@"
+        ;;
+    add-subnet)
+        add_subnet "$@"
         ;;
     delete)
         delete_vpc "$@"
