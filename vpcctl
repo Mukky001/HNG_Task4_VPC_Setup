@@ -289,126 +289,123 @@ save_subnet_state() {
     
     log_info "Saved subnet state: $subnet_name"
 }
-# Add subnet to VPC
+# Add subnet
 add_subnet() {
-    local vpc_name=""
-    local subnet_name=""
-    local subnet_cidr=""
-    local subnet_type="private"  # default to private
+    local vpc_name="" subnet_name="" subnet_cidr="" subnet_type="private"
     
-    # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --vpc)
-                vpc_name="$2"
-                shift 2
-                ;;
-            --name)
-                subnet_name="$2"
-                shift 2
-                ;;
-            --cidr)
-                subnet_cidr="$2"
-                shift 2
-                ;;
-            --type)
-                subnet_type="$2"
-                shift 2
-                ;;
-            *)
-                log_error "Unknown option: $1"
-                exit 1
-                ;;
+            --vpc) vpc_name="$2"; shift 2 ;;
+            --name) subnet_name="$2"; shift 2 ;;
+            --cidr) subnet_cidr="$2"; shift 2 ;;
+            --type) subnet_type="$2"; shift 2 ;;
+            *) log_error "Unknown option: $1"; exit 1 ;;
         esac
     done
     
-    # Validate inputs
-    if [[ -z "$vpc_name" || -z "$subnet_name" || -z "$subnet_cidr" ]]; then
+    [[ -z "$vpc_name" || -z "$subnet_name" || -z "$subnet_cidr" ]] && {
         log_error "Missing required arguments"
-        echo "Usage: vpcctl add-subnet --vpc <vpc-name> --name <subnet-name> --cidr <cidr> [--type public|private]"
+        echo "Usage: vpcctl add-subnet --vpc <vpc> --name <name> --cidr <cidr> [--type public|private]"
         exit 1
-    fi
+    }
     
-    # Check if VPC exists
-    if ! vpc_exists "$vpc_name"; then
+    vpc_exists "$vpc_name" || {
         log_error "VPC '$vpc_name' does not exist"
         exit 1
-    fi
+    }
     
-    # Check if subnet already exists
-    if subnet_exists "$vpc_name" "$subnet_name"; then
-        log_error "Subnet '$subnet_name' already exists in VPC '$vpc_name'"
+    subnet_exists "$vpc_name" "$subnet_name" && {
+        log_error "Subnet '$subnet_name' already exists"
         exit 1
-    fi
+    }
     
     log_info "Creating subnet '$subnet_name' in VPC '$vpc_name'"
     log_info "  CIDR: $subnet_cidr"
     log_info "  Type: $subnet_type"
     
-    # Get VPC info
     local bridge_name="br-${vpc_name}"
-    
-    # Generate unique names for namespace and veth pair
     local ns_name="ns-${vpc_name}-${subnet_name}"
-    local veth_host="veth-${vpc_name}-${subnet_name}-host"
-    local veth_ns="veth-${vpc_name}-${subnet_name}-ns"
     
-    # Extract IP for the namespace interface (first usable IP in subnet)
-    local subnet_ip=$(echo "$subnet_cidr" | awk -F'[./]' '{print $1"."$2"."$3"."($4+2)"/"$5}')
+    # Generate short interface names (max 15 chars)
+    local hash=$(echo "${vpc_name}-${subnet_name}" | md5sum | cut -c1-6)
+    local veth_host="vh-${hash}"
+    local veth_ns="vn-${hash}"
     
-    # Get gateway IP (the bridge IP)
-    local gateway_ip=$(ip addr show "$bridge_name" | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
+    # Calculate IPs
+    local subnet_base=$(echo "$subnet_cidr" | cut -d'/' -f1)
+    local subnet_prefix=$(echo "$subnet_cidr" | cut -d'/' -f2)
     
-    log_info "Creating network namespace: $ns_name"
+    # For the namespace, use .10 in the subnet
+    local subnet_ip=$(echo "$subnet_base" | awk -F'.' '{print $1"."$2"."$3"."($4+10)}')
     
-    # Step 1: Create network namespace
+    # Gateway is the first IP in the subnet range (.1)
+    local gateway_ip=$(echo "$subnet_base" | awk -F'.' '{print $1"."$2"."$3"."($4+1)}')
+    
+    # Get VPC CIDR for routing
+    local vpc_cidr=$(jq -r --arg vpc "$vpc_name" '.[$vpc].cidr' "$STATE_FILE" 2>/dev/null)
+    
+    log_info "Interface names: $veth_host <-> $veth_ns"
+    log_info "Namespace IP: ${subnet_ip}/${subnet_prefix}"
+    log_info "Gateway IP: $gateway_ip"
+    log_info "VPC CIDR: $vpc_cidr"
+    
+    # Check if namespace exists and clean up
+    if ip netns list | grep -q "^${ns_name}"; then
+        log_warning "Namespace exists, cleaning up..."
+        ip netns del "$ns_name"
+    fi
+    
+    # Create namespace
     ip netns add "$ns_name" 2>/dev/null || {
-        log_error "Failed to create namespace. It may already exist."
+        log_error "Failed to create namespace"
         exit 1
     }
-    
     log_info "✓ Namespace created: $ns_name"
     
-    # Step 2: Create veth pair
-    log_info "Creating veth pair: $veth_host <-> $veth_ns"
-    ip link add "$veth_host" type veth peer name "$veth_ns"
+    # Create veth pair
+    ip link add "$veth_host" type veth peer name "$veth_ns" || {
+        log_error "Failed to create veth pair"
+        ip netns del "$ns_name" 2>/dev/null
+        exit 1
+    }
+    log_info "✓ Created veth pair: $veth_host <-> $veth_ns"
     
-    # Step 3: Move one end of veth into the namespace
+    # Move namespace end into namespace
     ip link set "$veth_ns" netns "$ns_name"
-    log_info "✓ Moved $veth_ns into namespace $ns_name"
     
-    # Step 4: Connect host end to bridge
+    # Connect host end to bridge
     ip link set "$veth_host" master "$bridge_name"
-    log_info "✓ Connected $veth_host to bridge $bridge_name"
-    
-    # Step 5: Bring up host end of veth
     ip link set "$veth_host" up
+    log_info "✓ Connected $veth_host to bridge"
     
-    # Step 6: Configure namespace end
-    # Bring up loopback interface in namespace
+    # Assign IP to the host-side veth (this is the gateway for the namespace)
+    ip addr add "${gateway_ip}/${subnet_prefix}" dev "$veth_host"
+    log_info "✓ Assigned gateway IP to host-side veth"
+    
+    # Configure inside namespace
     ip netns exec "$ns_name" ip link set lo up
-    
-    # Bring up veth interface in namespace
     ip netns exec "$ns_name" ip link set "$veth_ns" up
+    ip netns exec "$ns_name" ip addr add "${subnet_ip}/${subnet_prefix}" dev "$veth_ns"
+    log_info "✓ Configured namespace interface"
     
-    # Assign IP address in namespace
-    ip netns exec "$ns_name" ip addr add "$subnet_ip" dev "$veth_ns"
-    log_info "✓ Assigned IP $subnet_ip to $veth_ns in namespace"
+    # Add default route in namespace
+    ip netns exec "$ns_name" ip route add default via "$gateway_ip" dev "$veth_ns" || {
+        log_error "Failed to add default route"
+        exit 1
+    }
+    log_info "✓ Added default route via $gateway_ip"
     
-    # Step 7: Set default route in namespace (gateway is the bridge)
-    ip netns exec "$ns_name" ip route add default via "$gateway_ip"
-    log_info "✓ Set default gateway to $gateway_ip"
-    
-    # Step 8: Save subnet state
-    save_subnet_state "$vpc_name" "$subnet_name" "$subnet_cidr" "$subnet_type" "$ns_name" "$subnet_ip"
-    
+    save_subnet_state "$vpc_name" "$subnet_name" "$subnet_cidr" "$subnet_type" "$ns_name" "${subnet_ip}/${subnet_prefix}"
     log_info "✓ Subnet '$subnet_name' created successfully!"
     echo ""
     echo "Test connectivity:"
-    echo "  Ping gateway: sudo ip netns exec $ns_name ping -c 3 $gateway_ip"
-    echo "  Run command in subnet: sudo ip netns exec $ns_name <command>"
+    echo "  sudo ip netns exec $ns_name ping -c 3 $gateway_ip"
+    echo "  sudo ip netns exec $ns_name ip addr show"
+    echo "  sudo ip netns exec $ns_name ip route show"
     echo ""
 }
+
+    
 # Usage
 usage() {
     cat << EOF
