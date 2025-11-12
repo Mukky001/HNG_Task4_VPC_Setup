@@ -76,7 +76,6 @@ save_vpc_state() {
            }' "$STATE_FILE" > "$temp_file"
         mv "$temp_file" "$STATE_FILE"
     else
-        # Fallback: simple append (not perfect but works)
         log_warning "jq not found, using basic state management"
         cat > "$STATE_FILE" <<EOF
 {
@@ -91,6 +90,18 @@ EOF
     fi
     
     log_info "Saved VPC state: $vpc_name"
+}
+
+# Calculate gateway IP
+calculate_gateway_ip() {
+    local cidr=$1
+    local ip_part=$(echo "$cidr" | cut -d'/' -f1)
+    local prefix=$(echo "$cidr" | cut -d'/' -f2)
+    
+    local octets=($(echo "$ip_part" | tr '.' ' '))
+    octets[3]=$((${octets[3]} + 1))
+    
+    echo "${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}/$prefix"
 }
 
 # Create VPC
@@ -134,10 +145,7 @@ create_vpc() {
     # Generate bridge name
     local bridge_name="br-${vpc_name}"
     
-    # Extract gateway IP (first IP + 1)
-    local gateway_ip=$(echo "$cidr" | awk -F'[./]' '{print $1"."$2"."$3"."($4+1)"/"$5}')
-    
-    # Create Linux bridge
+    # Create Linux bridge (without IP initially)
     log_info "Creating bridge: $bridge_name"
     ip link add "$bridge_name" type bridge 2>/dev/null || {
         log_error "Failed to create bridge. It may already exist."
@@ -146,16 +154,20 @@ create_vpc() {
     
     # Bring bridge up
     ip link set "$bridge_name" up
-    
-    # Assign IP to bridge
-    ip addr add "$gateway_ip" dev "$bridge_name"
-    
     log_info "✓ Bridge created: $bridge_name"
-    log_info "✓ Gateway IP: $gateway_ip"
     
     # Enable IP forwarding
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
     log_info "✓ IP forwarding enabled"
+    
+    # Add iptables rules to allow forwarding for this VPC
+    iptables -I FORWARD -i "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -I FORWARD -o "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -I DOCKER-USER -i "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -I DOCKER-USER -o "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -i "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -I OUTPUT -o "$bridge_name" -j ACCEPT 2>/dev/null || true
+    log_info "✓ Firewall rules added"
     
     # Save state
     save_vpc_state "$vpc_name" "$cidr" "$bridge_name"
@@ -164,7 +176,263 @@ create_vpc() {
     echo ""
     echo "Next steps:"
     echo "  1. List VPCs: sudo vpcctl list"
-    echo "  2. Add subnets: sudo vpcctl add-subnet --vpc $vpc_name --name public --cidr 10.0.1.0/24"
+    echo "  2. Add subnets: sudo vpcctl add-subnet --vpc $vpc_name --name public --cidr 10.0.1.0/24 --type public"
+}
+
+# Check if subnet exists
+subnet_exists() {
+    local vpc_name=$1
+    local subnet_name=$2
+    init_state
+    
+    if command -v jq &> /dev/null; then
+        jq -e --arg vpc "$vpc_name" --arg subnet "$subnet_name" \
+            '.[$vpc].subnets[$subnet]' "$STATE_FILE" > /dev/null 2>&1
+    else
+        grep -q "\"$subnet_name\"" "$STATE_FILE" 2>/dev/null
+    fi
+}
+
+# Save subnet state
+save_subnet_state() {
+    local vpc_name=$1
+    local subnet_name=$2
+    local subnet_cidr=$3
+    local subnet_type=$4
+    local ns_name=$5
+    local subnet_ip=$6
+    local veth_host=$7
+    local veth_ns=$8
+    local gateway_ip=$9
+    
+    init_state
+    
+    if command -v jq &> /dev/null; then
+        local temp_file=$(mktemp)
+        jq --arg vpc "$vpc_name" \
+           --arg subnet "$subnet_name" \
+           --arg cidr "$subnet_cidr" \
+           --arg type "$subnet_type" \
+           --arg ns "$ns_name" \
+           --arg ip "$subnet_ip" \
+           --arg vhost "$veth_host" \
+           --arg vns "$veth_ns" \
+           --arg gw "$gateway_ip" \
+           '.[$vpc].subnets[$subnet] = {
+               "cidr": $cidr,
+               "type": $type,
+               "namespace": $ns,
+               "namespace_ip": $ip,
+               "veth_host": $vhost,
+               "veth_ns": $vns,
+               "gateway_ip": $gw,
+               "created_at": (now | todate)
+           }' "$STATE_FILE" > "$temp_file"
+        mv "$temp_file" "$STATE_FILE"
+    else
+        log_warning "jq not found, state update limited"
+    fi
+    
+    log_info "Saved subnet state: $subnet_name"
+}
+
+# Add subnet
+add_subnet() {
+    local vpc_name="" subnet_name="" subnet_cidr="" subnet_type="private"
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --vpc) vpc_name="$2"; shift 2 ;;
+            --name) subnet_name="$2"; shift 2 ;;
+            --cidr) subnet_cidr="$2"; shift 2 ;;
+            --type) subnet_type="$2"; shift 2 ;;
+            *) log_error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+    
+    [[ -z "$vpc_name" || -z "$subnet_name" || -z "$subnet_cidr" ]] && {
+        log_error "Missing required arguments"
+        echo "Usage: vpcctl add-subnet --vpc <vpc> --name <name> --cidr <cidr> [--type public|private]"
+        exit 1
+    }
+    
+    vpc_exists "$vpc_name" || {
+        log_error "VPC '$vpc_name' does not exist"
+        exit 1
+    }
+    
+    subnet_exists "$vpc_name" "$subnet_name" && {
+        log_error "Subnet '$subnet_name' already exists"
+        exit 1
+    }
+    
+    log_info "Creating subnet '$subnet_name' in VPC '$vpc_name'"
+    log_info "  CIDR: $subnet_cidr"
+    log_info "  Type: $subnet_type"
+    
+    # Get VPC info
+    if command -v jq &> /dev/null; then
+        local bridge_name=$(jq -r --arg vpc "$vpc_name" '.[$vpc].bridge' "$STATE_FILE")
+        local vpc_cidr=$(jq -r --arg vpc "$vpc_name" '.[$vpc].cidr' "$STATE_FILE")
+    else
+        local bridge_name="br-${vpc_name}"
+        local vpc_cidr=$(grep -A5 "\"$vpc_name\"" "$STATE_FILE" | grep cidr | cut -d'"' -f4)
+    fi
+    
+    local ns_name="ns-${vpc_name}-${subnet_name}"
+    
+    # Generate short interface names
+    local hash=$(echo "${vpc_name}-${subnet_name}" | md5sum | cut -c1-6)
+    local veth_host="vh-${hash}"
+    local veth_ns="vn-${hash}"
+    
+    # Calculate IPs
+    local subnet_base=$(echo "$subnet_cidr" | cut -d'/' -f1)
+    local subnet_prefix=$(echo "$subnet_cidr" | cut -d'/' -f2)
+    
+    # For the namespace, use .10 in the subnet
+    local subnet_ip=$(echo "$subnet_base" | awk -F'.' '{print $1"."$2"."$3"."($4+10)}')
+    
+    # Gateway is the first IP in the subnet range (.1)
+    local gateway_ip=$(echo "$subnet_base" | awk -F'.' '{print $1"."$2"."$3"."($4+1)}')
+    
+    log_info "Interface names: $veth_host <-> $veth_ns"
+    log_info "Namespace IP: ${subnet_ip}/${subnet_prefix}"
+    log_info "Gateway IP: $gateway_ip"
+    
+    # Check if namespace exists and clean up
+    if ip netns list | grep -q "^${ns_name}"; then
+        log_warning "Namespace exists, cleaning up..."
+        ip netns del "$ns_name"
+    fi
+    
+    # Create namespace
+    ip netns add "$ns_name" 2>/dev/null || {
+        log_error "Failed to create namespace"
+        exit 1
+    }
+    log_info "✓ Namespace created: $ns_name"
+    
+    # Create veth pair
+    ip link add "$veth_host" type veth peer name "$veth_ns" || {
+        log_error "Failed to create veth pair"
+        ip netns del "$ns_name" 2>/dev/null
+        exit 1
+    }
+    log_info "✓ Created veth pair: $veth_host <-> $veth_ns"
+    
+    # Move namespace end into namespace
+    ip link set "$veth_ns" netns "$ns_name"
+    
+    # Attach host end to bridge (as per task requirements)
+    ip link set "$veth_host" master "$bridge_name"
+    ip link set "$veth_host" up
+    log_info "✓ Connected $veth_host to bridge $bridge_name"
+    
+    # Assign gateway IP to the bridge
+    # Check if bridge already has an IP
+    local bridge_has_ip=$(ip addr show "$bridge_name" | grep -c 'inet ' || true)
+    if [[ "$bridge_has_ip" == "0" ]]; then
+        # First subnet - assign the VPC base IP to bridge as primary gateway
+        local vpc_gateway=$(calculate_gateway_ip "$vpc_cidr")
+        ip addr add "$vpc_gateway" dev "$bridge_name"
+        log_info "✓ Assigned VPC gateway $vpc_gateway to bridge"
+    fi
+    
+    # Add subnet-specific IP to bridge as secondary
+    ip addr add "${gateway_ip}/${subnet_prefix}" dev "$bridge_name" 2>/dev/null || {
+        log_warning "Gateway IP may already be assigned"
+    }
+    log_info "✓ Added subnet gateway ${gateway_ip}/${subnet_prefix} to bridge"
+    
+    # Configure inside namespace
+    ip netns exec "$ns_name" ip link set lo up
+    ip netns exec "$ns_name" ip link set "$veth_ns" up
+    ip netns exec "$ns_name" ip addr add "${subnet_ip}/${subnet_prefix}" dev "$veth_ns"
+    log_info "✓ Configured namespace interface"
+    
+    # Add default route in namespace
+    ip netns exec "$ns_name" ip route add default via "$gateway_ip" dev "$veth_ns" || {
+        log_error "Failed to add default route"
+        exit 1
+    }
+    log_info "✓ Added default route via $gateway_ip"
+    
+    # Add iptables rules for this subnet and bridge
+    iptables -I FORWARD -i "$veth_host" -j ACCEPT 2>/dev/null || true
+    iptables -I FORWARD -o "$veth_host" -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -i "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -I OUTPUT -o "$bridge_name" -j ACCEPT 2>/dev/null || true
+    
+    # Enable necessary sysctls
+    sysctl -w net.ipv4.conf.${veth_host}.forwarding=1 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.${bridge_name}.forwarding=1 > /dev/null 2>&1 || true
+    
+    # Critical: Enable proxy_arp on bridge to handle ARP for all subnets
+    sysctl -w net.ipv4.conf.${bridge_name}.proxy_arp=1 > /dev/null 2>&1 || true
+    log_info "✓ Configured routing and firewall rules"
+    
+    # If public subnet, add NAT
+    if [[ "$subnet_type" == "public" ]]; then
+        local default_iface=$(ip route | grep default | awk '{print $5}' | head -1)
+        if [[ -n "$default_iface" ]]; then
+            iptables -t nat -A POSTROUTING -s "$subnet_cidr" -o "$default_iface" -j MASQUERADE 2>/dev/null || true
+            log_info "✓ NAT configured for public subnet via $default_iface"
+        fi
+    fi
+    
+    # Update routes for inter-subnet communication within VPC
+    if command -v jq &> /dev/null; then
+        # Get existing subnets
+        local existing_subnets=$(jq -r --arg vpc "$vpc_name" '.[$vpc].subnets | keys[]' "$STATE_FILE" 2>/dev/null || echo "")
+        
+        for existing_subnet_name in $existing_subnets; do
+            if [[ "$existing_subnet_name" != "$subnet_name" ]]; then
+                local existing_cidr=$(jq -r --arg vpc "$vpc_name" --arg subnet "$existing_subnet_name" \
+                    '.[$vpc].subnets[$subnet].cidr' "$STATE_FILE")
+                local existing_ns=$(jq -r --arg vpc "$vpc_name" --arg subnet "$existing_subnet_name" \
+                    '.[$vpc].subnets[$subnet].namespace' "$STATE_FILE")
+                local existing_gateway=$(jq -r --arg vpc "$vpc_name" --arg subnet "$existing_subnet_name" \
+                    '.[$vpc].subnets[$subnet].gateway_ip' "$STATE_FILE" | cut -d'/' -f1)
+                
+                # Add route in existing namespace to reach new subnet
+                ip netns exec "$existing_ns" ip route add "$subnet_cidr" via "$gateway_ip" 2>/dev/null || true
+                
+                # Add route in new namespace to reach existing subnet
+                ip netns exec "$ns_name" ip route add "$existing_cidr" via "$gateway_ip" 2>/dev/null || true
+            fi
+        done
+    fi
+    
+    save_subnet_state "$vpc_name" "$subnet_name" "$subnet_cidr" "$subnet_type" "$ns_name" \
+                      "${subnet_ip}/${subnet_prefix}" "$veth_host" "$veth_ns" "${gateway_ip}/${subnet_prefix}"
+    
+    log_info "✓ Subnet '$subnet_name' created successfully!"
+    log_info "✓ Bridge $bridge_name routes traffic between subnets"
+    echo ""
+    echo "Test connectivity:"
+    echo "  sudo ip netns exec $ns_name ping -c 3 $gateway_ip"
+    echo "  ping -c 3 $subnet_ip"
+    if [[ "$subnet_type" == "public" ]]; then
+        echo "  sudo ip netns exec $ns_name ping -c 3 8.8.8.8"
+    fi
+    
+    # Show inter-subnet test commands if multiple subnets exist
+    if command -v jq &> /dev/null; then
+        local subnet_count=$(jq -r --arg vpc "$vpc_name" '.[$vpc].subnets | length' "$STATE_FILE" 2>/dev/null || echo "0")
+        if [[ "$subnet_count" -gt 1 ]]; then
+            echo ""
+            echo "Test inter-subnet routing:"
+            local other_subnets=$(jq -r --arg vpc "$vpc_name" --arg current "$subnet_name" \
+                '.[$vpc].subnets | to_entries[] | select(.key != $current) | .key' "$STATE_FILE" 2>/dev/null || echo "")
+            for other_name in $other_subnets; do
+                local other_ip=$(jq -r --arg vpc "$vpc_name" --arg subnet "$other_name" \
+                    '.[$vpc].subnets[$subnet].namespace_ip' "$STATE_FILE" | cut -d'/' -f1)
+                echo "  sudo ip netns exec $ns_name ping -c 3 $other_ip"
+            done
+        fi
+    fi
+    echo ""
 }
 
 # List VPCs
@@ -181,14 +449,19 @@ list_vpcs() {
     fi
     
     # Print header
-    printf "%-15s %-20s %-20s\n" "VPC NAME" "CIDR" "BRIDGE"
-    printf "%-15s %-20s %-20s\n" "--------" "----" "------"
+    printf "%-20s %-20s %-20s %-10s\n" "VPC NAME" "CIDR" "BRIDGE" "SUBNETS"
+    printf "%-20s %-20s %-20s %-10s\n" "--------" "----" "------" "-------"
     
-    # Simple parsing without jq
     if command -v jq &> /dev/null; then
-        jq -r 'to_entries[] | "\(.key)|\(.value.cidr)|\(.value.bridge)"' "$STATE_FILE" | \
-        while IFS='|' read -r name cidr bridge; do
-            printf "%-15s %-20s %-20s\n" "$name" "$cidr" "$bridge"
+        jq -r 'to_entries[] | "\(.key)|\(.value.cidr)|\(.value.bridge)|\(.value.subnets | length)"' "$STATE_FILE" | \
+        while IFS='|' read -r name cidr bridge subnet_count; do
+            printf "%-20s %-20s %-20s %-10s\n" "$name" "$cidr" "$bridge" "$subnet_count"
+            
+            # Print subnets
+            jq -r --arg vpc "$name" '.[$vpc].subnets | to_entries[] | "  └─ \(.key)|\(.value.cidr)|\(.value.type)"' "$STATE_FILE" | \
+            while IFS='|' read -r subnet_line subnet_cidr subnet_type; do
+                printf "%-20s %-20s %-20s\n" "$subnet_line" "$subnet_cidr" "$subnet_type"
+            done
         done
     else
         cat "$STATE_FILE"
@@ -224,16 +497,60 @@ delete_vpc() {
     
     log_info "Deleting VPC: $vpc_name"
     
-    local bridge_name="br-${vpc_name}"
-    
-    # Delete bridge
-    if ip link show "$bridge_name" &> /dev/null; then
-        ip link delete "$bridge_name"
-        log_info "✓ Deleted bridge: $bridge_name"
+    # Get VPC info
+    if command -v jq &> /dev/null; then
+        local bridge_name=$(jq -r --arg vpc "$vpc_name" '.[$vpc].bridge' "$STATE_FILE")
+        local subnets=$(jq -r --arg vpc "$vpc_name" '.[$vpc].subnets | keys[]' "$STATE_FILE" 2>/dev/null || echo "")
+        
+        # Delete all subnets first
+        for subnet_name in $subnets; do
+            log_info "Deleting subnet: $subnet_name"
+            
+            local ns_name=$(jq -r --arg vpc "$vpc_name" --arg subnet "$subnet_name" \
+                '.[$vpc].subnets[$subnet].namespace' "$STATE_FILE")
+            local veth_host=$(jq -r --arg vpc "$vpc_name" --arg subnet "$subnet_name" \
+                '.[$vpc].subnets[$subnet].veth_host' "$STATE_FILE")
+            local subnet_cidr=$(jq -r --arg vpc "$vpc_name" --arg subnet "$subnet_name" \
+                '.[$vpc].subnets[$subnet].cidr' "$STATE_FILE")
+            local subnet_type=$(jq -r --arg vpc "$vpc_name" --arg subnet "$subnet_name" \
+                '.[$vpc].subnets[$subnet].type' "$STATE_FILE")
+            
+            # Delete namespace
+            ip netns del "$ns_name" 2>/dev/null || true
+            log_info "  ✓ Deleted namespace: $ns_name"
+            
+            # Delete veth (automatically removes both ends)
+            if [[ -n "$veth_host" && "$veth_host" != "null" ]]; then
+                ip link del "$veth_host" 2>/dev/null || true
+                log_info "  ✓ Deleted veth pair: $veth_host"
+            fi
+            
+            # Remove iptables rules
+            iptables -D FORWARD -i "$veth_host" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -o "$veth_host" -j ACCEPT 2>/dev/null || true
+            
+            # Remove NAT rules if public
+            if [[ "$subnet_type" == "public" ]]; then
+                iptables -t nat -D POSTROUTING -s "$subnet_cidr" -j MASQUERADE 2>/dev/null || true
+            fi
+        done
+    else
+        local bridge_name="br-${vpc_name}"
     fi
     
+    # Delete bridge
+    ip link del "$bridge_name" 2>/dev/null || true
+    log_info "✓ Deleted bridge: $bridge_name"
+    
+    # Remove iptables rules for bridge
+    iptables -D FORWARD -i "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -D DOCKER-USER -i "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -D DOCKER-USER -o "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -i "$bridge_name" -j ACCEPT 2>/dev/null || true
+    iptables -D OUTPUT -o "$bridge_name" -j ACCEPT 2>/dev/null || true
+    
     # Remove from state
-    init_state
     if command -v jq &> /dev/null; then
         local temp_file=$(mktemp)
         jq --arg name "$vpc_name" 'del(.[$name])' "$STATE_FILE" > "$temp_file"
@@ -242,170 +559,7 @@ delete_vpc() {
     
     log_info "✓ VPC '$vpc_name' deleted successfully"
 }
-# Check if subnet exists
-subnet_exists() {
-    local vpc_name=$1
-    local subnet_name=$2
-    init_state
-    
-    if command -v jq &> /dev/null; then
-        jq -e --arg vpc "$vpc_name" --arg subnet "$subnet_name" \
-            '.[$vpc].subnets[$subnet]' "$STATE_FILE" > /dev/null 2>&1
-    else
-        grep -q "\"$subnet_name\"" "$STATE_FILE" 2>/dev/null
-    fi
-}
 
-# Save subnet state
-save_subnet_state() {
-    local vpc_name=$1
-    local subnet_name=$2
-    local subnet_cidr=$3
-    local subnet_type=$4
-    local ns_name=$5
-    local subnet_ip=$6
-    
-    init_state
-    
-    if command -v jq &> /dev/null; then
-        local temp_file=$(mktemp)
-        jq --arg vpc "$vpc_name" \
-           --arg subnet "$subnet_name" \
-           --arg cidr "$subnet_cidr" \
-           --arg type "$subnet_type" \
-           --arg ns "$ns_name" \
-           --arg ip "$subnet_ip" \
-           '.[$vpc].subnets[$subnet] = {
-               "cidr": $cidr,
-               "type": $type,
-               "namespace": $ns,
-               "ip": $ip,
-               "created_at": (now | todate)
-           }' "$STATE_FILE" > "$temp_file"
-        mv "$temp_file" "$STATE_FILE"
-    else
-        log_warning "jq not found, state update limited"
-    fi
-    
-    log_info "Saved subnet state: $subnet_name"
-}
-# Add subnet
-add_subnet() {
-    local vpc_name="" subnet_name="" subnet_cidr="" subnet_type="private"
-    
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --vpc) vpc_name="$2"; shift 2 ;;
-            --name) subnet_name="$2"; shift 2 ;;
-            --cidr) subnet_cidr="$2"; shift 2 ;;
-            --type) subnet_type="$2"; shift 2 ;;
-            *) log_error "Unknown option: $1"; exit 1 ;;
-        esac
-    done
-    
-    [[ -z "$vpc_name" || -z "$subnet_name" || -z "$subnet_cidr" ]] && {
-        log_error "Missing required arguments"
-        echo "Usage: vpcctl add-subnet --vpc <vpc> --name <name> --cidr <cidr> [--type public|private]"
-        exit 1
-    }
-    
-    vpc_exists "$vpc_name" || {
-        log_error "VPC '$vpc_name' does not exist"
-        exit 1
-    }
-    
-    subnet_exists "$vpc_name" "$subnet_name" && {
-        log_error "Subnet '$subnet_name' already exists"
-        exit 1
-    }
-    
-    log_info "Creating subnet '$subnet_name' in VPC '$vpc_name'"
-    log_info "  CIDR: $subnet_cidr"
-    log_info "  Type: $subnet_type"
-    
-    local bridge_name="br-${vpc_name}"
-    local ns_name="ns-${vpc_name}-${subnet_name}"
-    
-    # Generate short interface names (max 15 chars)
-    local hash=$(echo "${vpc_name}-${subnet_name}" | md5sum | cut -c1-6)
-    local veth_host="vh-${hash}"
-    local veth_ns="vn-${hash}"
-    
-    # Calculate IPs
-    local subnet_base=$(echo "$subnet_cidr" | cut -d'/' -f1)
-    local subnet_prefix=$(echo "$subnet_cidr" | cut -d'/' -f2)
-    
-    # For the namespace, use .10 in the subnet
-    local subnet_ip=$(echo "$subnet_base" | awk -F'.' '{print $1"."$2"."$3"."($4+10)}')
-    
-    # Gateway is the first IP in the subnet range (.1)
-    local gateway_ip=$(echo "$subnet_base" | awk -F'.' '{print $1"."$2"."$3"."($4+1)}')
-    
-    # Get VPC CIDR for routing
-    local vpc_cidr=$(jq -r --arg vpc "$vpc_name" '.[$vpc].cidr' "$STATE_FILE" 2>/dev/null)
-    
-    log_info "Interface names: $veth_host <-> $veth_ns"
-    log_info "Namespace IP: ${subnet_ip}/${subnet_prefix}"
-    log_info "Gateway IP: $gateway_ip"
-    log_info "VPC CIDR: $vpc_cidr"
-    
-    # Check if namespace exists and clean up
-    if ip netns list | grep -q "^${ns_name}"; then
-        log_warning "Namespace exists, cleaning up..."
-        ip netns del "$ns_name"
-    fi
-    
-    # Create namespace
-    ip netns add "$ns_name" 2>/dev/null || {
-        log_error "Failed to create namespace"
-        exit 1
-    }
-    log_info "✓ Namespace created: $ns_name"
-    
-    # Create veth pair
-    ip link add "$veth_host" type veth peer name "$veth_ns" || {
-        log_error "Failed to create veth pair"
-        ip netns del "$ns_name" 2>/dev/null
-        exit 1
-    }
-    log_info "✓ Created veth pair: $veth_host <-> $veth_ns"
-    
-    # Move namespace end into namespace
-    ip link set "$veth_ns" netns "$ns_name"
-    
-    # Connect host end to bridge
-    ip link set "$veth_host" master "$bridge_name"
-    ip link set "$veth_host" up
-    log_info "✓ Connected $veth_host to bridge"
-    
-    # Assign IP to the host-side veth (this is the gateway for the namespace)
-    ip addr add "${gateway_ip}/${subnet_prefix}" dev "$veth_host"
-    log_info "✓ Assigned gateway IP to host-side veth"
-    
-    # Configure inside namespace
-    ip netns exec "$ns_name" ip link set lo up
-    ip netns exec "$ns_name" ip link set "$veth_ns" up
-    ip netns exec "$ns_name" ip addr add "${subnet_ip}/${subnet_prefix}" dev "$veth_ns"
-    log_info "✓ Configured namespace interface"
-    
-    # Add default route in namespace
-    ip netns exec "$ns_name" ip route add default via "$gateway_ip" dev "$veth_ns" || {
-        log_error "Failed to add default route"
-        exit 1
-    }
-    log_info "✓ Added default route via $gateway_ip"
-    
-    save_subnet_state "$vpc_name" "$subnet_name" "$subnet_cidr" "$subnet_type" "$ns_name" "${subnet_ip}/${subnet_prefix}"
-    log_info "✓ Subnet '$subnet_name' created successfully!"
-    echo ""
-    echo "Test connectivity:"
-    echo "  sudo ip netns exec $ns_name ping -c 3 $gateway_ip"
-    echo "  sudo ip netns exec $ns_name ip addr show"
-    echo "  sudo ip netns exec $ns_name ip route show"
-    echo ""
-}
-
-    
 # Usage
 usage() {
     cat << EOF
@@ -415,13 +569,12 @@ Usage: vpcctl <command> [options]
 
 Commands:
     create      Create a new VPC
-    add-subnet   Add a subnet to a VPC
+    add-subnet  Add a subnet to a VPC
     delete      Delete a VPC
     list        List all VPCs
     help        Show this help message
 
 Examples:
-    Examples:
     # Create a VPC
     sudo vpcctl create --name dev-vpc --cidr 10.0.0.0/16
     
