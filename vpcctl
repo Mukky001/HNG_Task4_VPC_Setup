@@ -313,6 +313,16 @@ add_subnet() {
     }
     log_info "✓ Namespace created: $ns_name"
     
+    # Configure DNS for the namespace
+    local netns_etc="/etc/netns/${ns_name}"
+    mkdir -p "$netns_etc"
+    cat > "$netns_etc/resolv.conf" <<EOF
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+EOF
+    log_info "✓ Configured DNS for namespace"
+    
     # Create veth pair
     ip link add "$veth_host" type veth peer name "$veth_ns" || {
         log_error "Failed to create veth pair"
@@ -519,6 +529,13 @@ delete_vpc() {
             ip netns del "$ns_name" 2>/dev/null || true
             log_info "  ✓ Deleted namespace: $ns_name"
             
+            # Clean up DNS configuration
+            local netns_etc="/etc/netns/${ns_name}"
+            if [[ -d "$netns_etc" ]]; then
+                rm -rf "$netns_etc"
+                log_info "  ✓ Cleaned up DNS config"
+            fi
+            
             # Delete veth (automatically removes both ends)
             if [[ -n "$veth_host" && "$veth_host" != "null" ]]; then
                 ip link del "$veth_host" 2>/dev/null || true
@@ -559,7 +576,93 @@ delete_vpc() {
     
     log_info "✓ VPC '$vpc_name' deleted successfully"
 }
-
+# Enable NAT for a subnet
+enable_nat() {
+    local vpc_name=""
+    local subnet_name=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --vpc) vpc_name="$2"; shift 2 ;;
+            --subnet) subnet_name="$2"; shift 2 ;;
+            *) log_error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+    
+    [[ -z "$vpc_name" || -z "$subnet_name" ]] && {
+        log_error "Missing required arguments"
+        echo "Usage: vpcctl enable-nat --vpc <vpc> --subnet <subnet>"
+        exit 1
+    }
+    
+    log_info "Enabling NAT for subnet '$subnet_name' in VPC '$vpc_name'"
+    
+    # Get subnet info from state
+    if ! command -v jq &> /dev/null; then
+        log_error "jq is required for this command"
+        exit 1
+    fi
+    
+    local subnet_cidr=$(jq -r --arg vpc "$vpc_name" --arg subnet "$subnet_name" \
+        '.[$vpc].subnets[$subnet].cidr' "$STATE_FILE" 2>/dev/null)
+    
+    if [[ -z "$subnet_cidr" || "$subnet_cidr" == "null" ]]; then
+        log_error "Subnet '$subnet_name' not found in VPC '$vpc_name'"
+        exit 1
+    fi
+    
+    # Get host's internet interface
+    local internet_iface=$(ip route | grep default | awk '{print $5}' | head -1)
+    
+    if [[ -z "$internet_iface" ]]; then
+        log_error "Could not determine internet interface"
+        log_error "Please check: ip route | grep default"
+        exit 1
+    fi
+    
+    log_info "Subnet CIDR: $subnet_cidr"
+    log_info "Internet interface: $internet_iface"
+    
+    # Enable IP forwarding
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    log_info "✓ IP forwarding enabled"
+    
+    # Check if NAT rule already exists
+    if iptables -t nat -C POSTROUTING -s "$subnet_cidr" -o "$internet_iface" -j MASQUERADE 2>/dev/null; then
+        log_warning "NAT rule already exists for $subnet_cidr"
+    else
+        # Add NAT rule (MASQUERADE)
+        iptables -t nat -A POSTROUTING -s "$subnet_cidr" -o "$internet_iface" -j MASQUERADE
+        log_info "✓ Added NAT rule for $subnet_cidr"
+    fi
+    
+    # Add forwarding rules
+    if ! iptables -C FORWARD -s "$subnet_cidr" -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -s "$subnet_cidr" -j ACCEPT
+        log_info "✓ Added forward rule (outbound)"
+    fi
+    
+    if ! iptables -C FORWARD -d "$subnet_cidr" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -d "$subnet_cidr" -m state --state RELATED,ESTABLISHED -j ACCEPT
+        log_info "✓ Added forward rule (inbound established)"
+    fi
+    
+    # Also allow forwarding through bridge
+    local bridge_name=$(jq -r --arg vpc "$vpc_name" '.[$vpc].bridge' "$STATE_FILE")
+    if [[ -n "$bridge_name" && "$bridge_name" != "null" ]]; then
+        iptables -I FORWARD -i "$bridge_name" -o "$internet_iface" -j ACCEPT 2>/dev/null || true
+        iptables -I FORWARD -i "$internet_iface" -o "$bridge_name" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        log_info "✓ Added bridge forwarding rules"
+    fi
+    
+    log_info "✓ NAT enabled successfully for subnet '$subnet_name'"
+    echo ""
+    echo "Test internet access:"
+    local ns_name="ns-${vpc_name}-${subnet_name}"
+    echo "  sudo ip netns exec $ns_name ping -c 3 8.8.8.8"
+    echo "  sudo ip netns exec $ns_name curl -I https://www.google.com"
+    echo ""
+}
 # Usage
 usage() {
     cat << EOF
